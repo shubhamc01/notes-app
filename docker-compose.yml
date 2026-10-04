@@ -1,0 +1,16 @@
+services:
+  web:
+    build: ./web
+    ports: ["3000:3000"]
+  api:
+    build: .
+    ports: ["5000:5000"]
+    env_file: [.env.example]
+    depends_on: [db]
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: notes
+      MYSQL_USER: notes
+      MYSQL_PASSWORD: notes
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
