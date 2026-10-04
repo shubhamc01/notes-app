@@ -123,7 +123,7 @@ resource "aws_iam_role" "deploy_dev" {
           "Condition": {
             "StringEquals": {
               "token.actions.githubusercontent.com:sub": [
-                "repo:shubhamc01/notes-app:environment:dev"
+                "repo:shubhamc01@327102562/notes-app@1404437167:environment:dev"
               ]
             }
           }
@@ -219,7 +219,7 @@ resource "aws_iam_role" "infra_apply_dev" {
           "Condition": {
             "StringEquals": {
               "token.actions.githubusercontent.com:sub": [
-                "repo:shubhamc01/notes-app:environment:dev-infra"
+                "repo:shubhamc01@327102562/notes-app@1404437167:environment:dev-infra"
               ]
             }
           }
@@ -377,7 +377,7 @@ resource "aws_iam_role" "infra_plan" {
           "Condition": {
             "StringEquals": {
               "token.actions.githubusercontent.com:sub": [
-                "repo:shubhamc01/notes-app:pull_request"
+                "repo:shubhamc01@327102562/notes-app@1404437167:pull_request"
               ]
             }
           }
