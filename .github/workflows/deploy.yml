@@ -1,0 +1,104 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-dev:
+    name: Deploy dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Check deployment infrastructure variables
+        shell: bash
+        env:
+          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+          DA_DEPLOY_ROLE_ARN_DEV: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
+          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
+          DA_HOST_INSTANCE_ID_DEV: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
+          DA_HOST_IP_DEV: ${{ vars.DA_HOST_IP_DEV }}
+          DA_HOST_URL_DEV: ${{ vars.DA_HOST_URL_DEV }}
+        run: |
+          missing=()
+          for name in \
+            DA_AWS_REGION \
+            DA_DEPLOY_ROLE_ARN_DEV \
+            DA_ECR_REPOSITORY_URL \
+            DA_HOST_INSTANCE_ID_DEV \
+            DA_HOST_IP_DEV \
+            DA_HOST_URL_DEV; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            echo "infrastructure not applied yet: missing deployment variables: ${missing[*]}" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.DA_AWS_REGION }}
+      - name: Log in to Amazon ECR
+        env:
+          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
+        run: |
+          registry="${DA_ECR_REPOSITORY_URL%%/*}"
+          aws ecr get-login-password --region "$DA_AWS_REGION" \
+            | docker login --username AWS --password-stdin "$registry"
+      - name: Build and push the immutable commit image
+        env:
+          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
+        run: |
+          image="${DA_ECR_REPOSITORY_URL}:${GITHUB_SHA}"
+          docker build --tag "$image" .
+          docker push "$image"
+      - name: Deploy through SSM Run Command
+        env:
+          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
+          DA_HOST_INSTANCE_ID_DEV: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
+          DA_HOST_IP_DEV: ${{ vars.DA_HOST_IP_DEV }}
+          DA_HOST_URL_DEV: ${{ vars.DA_HOST_URL_DEV }}
+          DA_SITE_DOMAINS_DEV: ${{ vars.DA_SITE_DOMAINS_DEV }}
+        shell: bash
+        run: |
+          # The host-side deployment script handles certificate provisioning,
+          # health verification, and rollback.
+          printf -v remote_command \
+            'cd /opt/app && export DEPLOY_ENV=%q IMAGE_TAG=%q DA_AWS_REGION=%q DA_ECR_REPOSITORY_URL=%q DA_HOST_IP_DEV=%q DA_HOST_URL_DEV=%q DA_SITE_DOMAINS_DEV=%q && ./deploy/deploy.sh' \
+            "dev" "$GITHUB_SHA" "$DA_AWS_REGION" "$DA_ECR_REPOSITORY_URL" \
+            "$DA_HOST_IP_DEV" "$DA_HOST_URL_DEV" "$DA_SITE_DOMAINS_DEV"
+          parameters="$(jq -n --arg command "$remote_command" '{commands: [$command]}')"
+          command_id="$(aws ssm send-command \
+            --instance-ids "$DA_HOST_INSTANCE_ID_DEV" \
+            --document-name AWS-RunShellScript \
+            --parameters "$parameters" \
+            --query 'Command.CommandId' \
+            --output text)"
+          if aws ssm wait command-executed \
+            --command-id "$command_id" \
+            --instance-id "$DA_HOST_INSTANCE_ID_DEV"; then
+            aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$DA_HOST_INSTANCE_ID_DEV" \
+              --query 'StandardOutputContent' \
+              --output text
+          else
+            aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$DA_HOST_INSTANCE_ID_DEV" \
+              --query '{Status:Status, StandardOutput:StandardOutputContent, StandardError:StandardErrorContent}' \
+              --output json >&2 || true
+            echo "SSM deployment failed for commit ${GITHUB_SHA}" >&2
+            exit 1
+          fi

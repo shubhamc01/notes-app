@@ -1,0 +1,86 @@
+{
+  "files": {
+    "deploy/nginx/http.conf": "611a96e1221968775071d192fea0e08920b43d455dce207c87c1cd9347bff519",
+    "deploy/nginx/https.conf": "2060c5d6c489947bf9db9714d1f6b48b9312226b5a6abb45a9fc79161c3a7059",
+    "infra/bootstrap/main.tf": "44b3d1a477b3d976f5d77cfa816092b302e496c45d7f2fd9a03570e9ce41da7c",
+    "infra/bootstrap/outputs.tf": "5b0db5e2b47bcfecc03d4b0a66c010563568c2ccd7b4f6d5f8f6b945cc8612a0",
+    "infra/bootstrap/versions.tf": "448c9b0e9b6dc3dd394269fc3fea675ae0033c72cb559d0679c4b7705f170fba",
+    "infra/dev/backend.tf": "ed14950e7d8c11e48dcca268fe43235db4a1fecdd52af073789ff3e3b47ce7f6",
+    "infra/dev/main.tf": "28425930d06af8abd8ee69bd2be4cc882f9f94c5dfcc22bcada5dc1d6d768509",
+    "infra/dev/outputs.tf": "04a31681d9ef3c57edfdd2f826f873015ea85f1973cf162dd55923db28e1154a",
+    "infra/dev/versions.tf": "9dce9f540c7d0c5196b01910e2eec01a895f5ed0277346a6d32d38399cd34010",
+    "infra/modules/app/_engine_locals.tf": "e510edd11b9d2f123fa7d1ea2ee8c6c0966b945c1f141fd56985b1ed9b489d96",
+    "infra/modules/app/_engine_security.tf": "4b62fd40ea42505fb8a78b800a5206695f25d09c989eef0a4297699a5d414202",
+    "infra/modules/app/outputs.tf": "b1298c8d26a8477c10cf5b2a69e7d1143eb5e2232a64e24b14b6402e58914384",
+    "infra/modules/app/variables.tf": "b3c8b68352695f441de78be891538b64bfbec8c6098223ee62ee742bdb358f31"
+  },
+  "llm_files": [
+    "infra/modules/app/main.tf"
+  ],
+  "privileged_types": [
+    "aws_iam_.*",
+    "aws_(s3_bucket|ecr_repository|ecr_registry|sqs_queue|sns_topic|secretsmanager_secret|cloudwatch_log_resource|opensearch_domain|elasticsearch_domain|api_gateway_rest_api|backup_vault|efs_file_system|glacier_vault|kms_key)_policy",
+    "aws_s3_bucket_public_access_block",
+    "aws_s3_bucket_acl",
+    "aws_s3_account_public_access_block",
+    "aws_lambda_function_url",
+    "aws_network_acl.*",
+    "aws_ssoadmin_.*",
+    "aws_route53_.*",
+    "aws_acm_.*",
+    "aws_eip.*",
+    "aws_ram_.*",
+    "aws_lambda_permission",
+    "aws_kms_.*",
+    "aws_organizations_.*",
+    "aws_lakeformation_.*",
+    "google_.*_iam_.*",
+    "google_service_account.*",
+    "google_project_iam_.*",
+    "google_kms_.*",
+    "google_iam_workload_identity_pool.*",
+    "azurerm_role_.*",
+    "azurerm_.*_access_policy",
+    "azurerm_user_assigned_identity",
+    "azurerm_federated_identity_credential",
+    "azurerm_key_vault.*",
+    "kubernetes_cluster_role.*",
+    "kubernetes_role_binding.*"
+  ],
+  "roots": {
+    "infra/bootstrap": {
+      "boundary": null,
+      "engine_addresses": [
+        "aws_ecr_lifecycle_policy.app",
+        "aws_ecr_repository.app",
+        "aws_iam_policy.boundary_dev",
+        "aws_iam_role.deploy_dev",
+        "aws_iam_role.infra_apply_dev",
+        "aws_iam_role.infra_plan",
+        "aws_iam_role_policy.deploy_dev",
+        "aws_iam_role_policy.infra_apply_dev",
+        "aws_iam_role_policy.infra_plan",
+        "aws_iam_role_policy_attachment.infra_plan_0",
+        "aws_s3_bucket.state",
+        "aws_s3_bucket_policy.state",
+        "aws_s3_bucket_public_access_block.state",
+        "aws_s3_bucket_server_side_encryption_configuration.state",
+        "aws_s3_bucket_versioning.state"
+      ],
+      "prod": false
+    },
+    "infra/dev": {
+      "boundary": "arn:aws:iam::407493720885:policy/notes-app-f308-dev-boundary",
+      "engine_addresses": [
+        "module.app.aws_eip.host",
+        "module.app.aws_iam_instance_profile.host",
+        "module.app.aws_iam_role.host",
+        "module.app.aws_iam_role_policy.host_runtime",
+        "module.app.aws_iam_role_policy_attachment.host_ecr_read",
+        "module.app.aws_iam_role_policy_attachment.host_ssm",
+        "module.app.aws_security_group.host"
+      ],
+      "prod": false
+    }
+  }
+}
