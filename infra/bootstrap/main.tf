@@ -117,7 +117,7 @@ resource "aws_iam_role" "deploy_dev" {
         {
           "Effect": "Allow",
           "Principal": {
-            "Federated": ${data.aws_iam_openid_connect_provider.ci.arn}
+            "Federated": "${data.aws_iam_openid_connect_provider.ci.arn}"
           },
           "Action": "sts:AssumeRoleWithWebIdentity",
           "Condition": {
@@ -213,7 +213,7 @@ resource "aws_iam_role" "infra_apply_dev" {
         {
           "Effect": "Allow",
           "Principal": {
-            "Federated": ${data.aws_iam_openid_connect_provider.ci.arn}
+            "Federated": "${data.aws_iam_openid_connect_provider.ci.arn}"
           },
           "Action": "sts:AssumeRoleWithWebIdentity",
           "Condition": {
@@ -371,7 +371,7 @@ resource "aws_iam_role" "infra_plan" {
         {
           "Effect": "Allow",
           "Principal": {
-            "Federated": ${data.aws_iam_openid_connect_provider.ci.arn}
+            "Federated": "${data.aws_iam_openid_connect_provider.ci.arn}"
           },
           "Action": "sts:AssumeRoleWithWebIdentity",
           "Condition": {

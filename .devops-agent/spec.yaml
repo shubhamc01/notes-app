@@ -22,8 +22,9 @@ k8s_stateful: null
 traffic_entry: null
 target_infra_seen: {}
 app_id: notes-app-f308
-account_bindings: {}
-account_id: null
+account_bindings:
+  infra/bootstrap: '407493720885'
+account_id: '407493720885'
 provenance:
   host:
     source: detected
