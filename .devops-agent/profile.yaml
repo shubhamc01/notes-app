@@ -1,0 +1,28 @@
+schema_version: 1
+root: /Users/techverito/migration/new-ref-git/demo-apps/notes-app
+git_host: github
+git_remote: https://github.com/shubhamc01/notes-app.git
+components:
+- name: notes-app
+  path: .
+  language: python
+  framework: flask
+  build_tool: pip
+  app_type: api
+assets:
+  ci_files: []
+  dockerfiles:
+  - web/Dockerfile
+  compose_files:
+  - docker-compose.yml
+  k8s_manifests: []
+  iac_files: []
+  helm_charts: []
+  kustomizations: []
+  argocd_files: []
+  flux_files: []
+  k8s_conventions: []
+  k8s_kinds: []
+  k8s_annotation_keys: []
+needs:
+- database
