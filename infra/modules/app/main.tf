@@ -14,22 +14,16 @@ resource "aws_instance" "host" {
   vpc_security_group_ids      = [aws_security_group.host.id]
   iam_instance_profile        = aws_iam_instance_profile.host.name
   associate_public_ip_address = true
+  user_data                   = local.host_user_data
+  user_data_replace_on_change = true
 
   root_block_device {
     volume_type = "gp3"
-    volume_size = 30
     encrypted   = true
+    volume_size = 30
   }
 
   metadata_options {
     http_tokens = "required"
   }
-
-  user_data = <<-EOF
-    #!/bin/bash
-    set -euxo pipefail
-    dnf install -y docker docker-compose-plugin
-    systemctl enable --now docker
-    mkdir -p /opt/app
-  EOF
 }

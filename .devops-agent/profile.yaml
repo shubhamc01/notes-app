@@ -10,8 +10,12 @@ components:
   build_tool: pip
   app_type: api
 assets:
-  ci_files: []
+  ci_files:
+  - .github/workflows/ci.yml
+  - .github/workflows/deploy.yml
+  - .github/workflows/infra.yml
   dockerfiles:
+  - Dockerfile
   - web/Dockerfile
   compose_files:
   - docker-compose.yml

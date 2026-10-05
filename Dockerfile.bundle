@@ -1,0 +1,3 @@
+# This tiny image transports deployment files to hosts that do not contain the repo.
+FROM scratch
+COPY docker-compose.prod.yml deploy/ /app/

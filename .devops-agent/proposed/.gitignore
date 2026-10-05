@@ -1,0 +1,4 @@
+# Local Terraform bootstrap state and provider/plugin caches
+.terraform/
+*.tfstate
+*.tfstate.*
