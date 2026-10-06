@@ -1,49 +1,8 @@
-# Single-VM deployment: no HA and scaling requires a larger host or re-architecture.
-# Persist database data and certificates in volumes; never rely on container filesystems.
 services:
-  web:
-    image: ${DA_ECR_REPOSITORY_URL:?required}:web-${IMAGE_TAG:?required}
-    env_file: web.env
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options: {max-size: '10m', max-file: '3'}
-    healthcheck:
-      test: [CMD, node, -e, "require('http').get('http://127.0.0.1:3000/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-  api:
-    image: ${DA_ECR_REPOSITORY_URL:?required}:api-${IMAGE_TAG:?required}
-    env_file: api.env
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options: {max-size: '10m', max-file: '3'}
-    healthcheck:
-      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).close()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-  db:
-    image: mysql:8.4.7
-    env_file: db.env
-    volumes:
-      - mysql-data:/var/lib/mysql
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options: {max-size: '10m', max-file: '3'}
-    healthcheck:
-      test: [CMD-SHELL, "MYSQL_PWD=\"$$MYSQL_PASSWORD\" mysql -h 127.0.0.1 -u \"$$MYSQL_USER\" -e 'SELECT 1' \"$$MYSQL_DATABASE\" >/dev/null"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
   proxy:
-    image: nginx:1.28.0-alpine
+    # Single-host Compose is not HA; use a load-balanced multi-host platform if downtime matters.
+    image: nginx:1.28.0
+    restart: unless-stopped
     ports:
       - '80:80'
       - '443:443'
@@ -52,26 +11,63 @@ services:
       - certbot-www:/var/www/certbot:ro
       - letsencrypt:/etc/letsencrypt:ro
     command: /bin/sh -c 'while :; do sleep 6h & wait $!; nginx -s reload; done & nginx -g "daemon off;"'
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options: {max-size: '10m', max-file: '3'}
     healthcheck:
-      test: [CMD, nginx, -t]
+      test: ["CMD-SHELL", "nginx -t >/dev/null 2>&1"]
       interval: 30s
       timeout: 5s
       retries: 3
+    logging: {driver: json-file, options: {max-size: '10m', max-file: '3'}}
   certbot:
     image: certbot/certbot:v4.0.0
+    restart: unless-stopped
     volumes:
       - certbot-www:/var/www/certbot
       - letsencrypt:/etc/letsencrypt
     entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $!; done'
+    logging: {driver: json-file, options: {max-size: '10m', max-file: '3'}}
+  web:
+    image: ${DA_ECR_REPOSITORY_URL:?required}:web-${IMAGE_TAG:?required}
+    env_file: web.env
     restart: unless-stopped
-    logging:
-      driver: json-file
-      options: {max-size: '10m', max-file: '3'}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r => {if (!r.ok) process.exit(1)}).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    logging: {driver: json-file, options: {max-size: '10m', max-file: '3'}}
+  api:
+    image: ${DA_ECR_REPOSITORY_URL:?required}:api-${IMAGE_TAG:?required}
+    env_file: api.env
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    logging: {driver: json-file, options: {max-size: '10m', max-file: '3'}}
+  db:
+    image: mysql:8.4
+    env_file: db.env
+    restart: unless-stopped
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -u \"$$MYSQL_USER\" -p\"$$MYSQL_PASSWORD\" -e 'SELECT 1' \"$$MYSQL_DATABASE\" >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 90s
+      retries: 10
+    logging: {driver: json-file, options: {max-size: '10m', max-file: '3'}}
 volumes:
-  mysql-data:
+  db-data:
   certbot-www:
   letsencrypt:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /etc/letsencrypt

@@ -1,3 +1,2 @@
 FROM scratch
-COPY docker-compose.prod.yml /app/docker-compose.prod.yml
-COPY deploy/ /app/deploy/
+COPY docker-compose.prod.yml deploy/ /app/
