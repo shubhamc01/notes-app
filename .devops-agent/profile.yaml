@@ -16,6 +16,7 @@ assets:
   - .github/workflows/infra.yml
   dockerfiles:
   - Dockerfile
+  - Dockerfile.bundle
   - web/Dockerfile
   compose_files:
   - docker-compose.yml

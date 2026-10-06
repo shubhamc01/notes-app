@@ -1,8 +1,11 @@
 name: Infrastructure
+
 on:
   pull_request:
+    paths: ['infra/**', '.github/workflows/infra.yml']
   push:
     branches: [main]
+    paths: ['infra/**', '.github/workflows/infra.yml']
 
 permissions:
   contents: read
@@ -13,133 +16,114 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan-dev:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+  bootstrap-check:
+    # Never grant OIDC credentials to a fork PR.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
     steps:
-      - name: Check infrastructure bootstrap
-        id: bootstrap
+      - name: Check bootstrap before any planning
+        id: check
         env:
-          REGION: ${{ vars.DA_AWS_REGION }}
-          PLAN_ROLE: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
-          STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+          DA_INFRA_PLAN_ROLE_ARN: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
         run: |
-          set -euo pipefail
-          if [ -z "$REGION" ] || [ -z "$PLAN_ROLE" ] || [ -z "$STATE_BUCKET" ]; then
+          if [[ -z "$DA_AWS_REGION" || -z "$DA_INFRA_PLAN_ROLE_ARN" ]]; then
             echo 'infrastructure bootstrap not applied yet — run devops-agent up (or apply) first'
             echo 'ready=false' >> "$GITHUB_OUTPUT"
           else
             echo 'ready=true' >> "$GITHUB_OUTPUT"
           fi
+
+  pr-plan:
+    if: github.event_name == 'pull_request' && needs.bootstrap-check.outputs.ready == 'true'
+    needs: bootstrap-check
+    runs-on: ubuntu-latest
+    env:
+      DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+      DA_STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+    steps:
       - uses: actions/checkout@v7
-        if: steps.bootstrap.outputs.ready == 'true'
-        with:
-          persist-credentials: false
       - uses: hashicorp/setup-terraform@v3
-        if: steps.bootstrap.outputs.ready == 'true'
         with:
           terraform_wrapper: false
-      - name: Authenticate plan role using OIDC
-        if: steps.bootstrap.outputs.ready == 'true'
+      - name: Verify state bucket is configured
+        run: |
+          if [[ -z "$DA_STATE_BUCKET" ]]; then echo 'infrastructure not applied yet' >&2; exit 1; fi
+      - name: Assume read-only plan role via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
+          aws-region: ${{ env.DA_AWS_REGION }}
           role-to-assume: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
           audience: sts.amazonaws.com
       - name: Format, initialize, validate, plan and enforce policy (infra/dev)
-        if: steps.bootstrap.outputs.ready == 'true'
-        env:
-          REGION: ${{ vars.DA_AWS_REGION }}
-          STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+        shell: bash
         run: |
           set -euo pipefail
-          terraform -chdir=infra/dev fmt -check
-          terraform -chdir=infra/dev init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$REGION"
-          terraform -chdir=infra/dev validate
-          # Never write the human-readable plan to CI logs: it can contain values.
-          if ! terraform -chdir=infra/dev plan -input=false -lock=false -out=plan.tfplan > /tmp/notes-infra-plan.log 2>&1; then
-            echo 'Terraform plan failed (plan output withheld to protect values).' >&2
+          root=infra/dev
+          terraform -chdir="$root" fmt -check
+          terraform -chdir="$root" init -input=false -backend-config="bucket=${DA_STATE_BUCKET}" -backend-config="region=${DA_AWS_REGION}"
+          terraform -chdir="$root" validate
+          # The saved plan is local to the runner. Do not print plan output or
+          # upload its JSON: it can contain sensitive values.
+          if ! terraform -chdir="$root" plan -lock=false -input=false -out="$RUNNER_TEMP/dev.tfplan" > "$RUNNER_TEMP/plan.log" 2>&1; then
+            echo 'Terraform plan failed; inspect the root without publishing plan values' >&2
             exit 1
           fi
-          terraform -chdir=infra/dev show -json plan.tfplan > plan.json
-          python3 infra/policy_check.py infra/dev infra/dev/plan.json
-          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          terraform -chdir="$root" show -json "$RUNNER_TEMP/dev.tfplan" > "$RUNNER_TEMP/dev.plan.json"
+          python3 infra/policy_check.py "$root" "$RUNNER_TEMP/dev.plan.json"
+          python3 - "$RUNNER_TEMP/dev.plan.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json
-          from pathlib import Path
-
-          plan = json.loads(Path('infra/dev/plan.json').read_text())
+          import sys
+          with open(sys.argv[1], encoding='utf-8') as source:
+              changes = json.load(source).get('resource_changes', [])
           print('### infra/dev resource actions')
-          for item in plan.get('resource_changes', []):
-              print(f"- `{item['address']}`: `{','.join(item['change']['actions'])}`")
+          for change in changes:
+              print('- ' + change['address'] + ': ' + ', '.join(change['change']['actions']))
           PY
-      - name: Remove local plan artifacts
-        if: always() && steps.bootstrap.outputs.ready == 'true'
-        run: rm -f infra/dev/plan.tfplan infra/dev/plan.json /tmp/notes-infra-plan.log
 
-  apply-dev:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  dev-apply:
+    if: github.event_name == 'push' && needs.bootstrap-check.outputs.ready == 'true'
+    needs: bootstrap-check
     environment: dev-infra
     runs-on: ubuntu-latest
+    env:
+      DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+      DA_STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+      DA_INFRA_APPLY_ROLE_ARN_DEV: ${{ vars.DA_INFRA_APPLY_ROLE_ARN_DEV }}
     steps:
-      - name: Check infrastructure bootstrap
-        id: bootstrap
-        env:
-          REGION: ${{ vars.DA_AWS_REGION }}
-          PLAN_ROLE: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
-          STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+      - name: Check apply configuration
         run: |
-          set -euo pipefail
-          if [ -z "$REGION" ] || [ -z "$PLAN_ROLE" ] || [ -z "$STATE_BUCKET" ]; then
-            echo 'infrastructure bootstrap not applied yet — run devops-agent up (or apply) first'
-            echo 'ready=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'ready=true' >> "$GITHUB_OUTPUT"
-          fi
-      - name: Check apply role
-        if: steps.bootstrap.outputs.ready == 'true'
-        env:
-          APPLY_ROLE: ${{ vars.DA_INFRA_APPLY_ROLE_ARN_DEV }}
-        run: |
-          if [ -z "$APPLY_ROLE" ]; then
+          if [[ -z "$DA_STATE_BUCKET" || -z "$DA_INFRA_APPLY_ROLE_ARN_DEV" ]]; then
             echo 'infrastructure not applied yet' >&2
             exit 1
           fi
       - uses: actions/checkout@v7
-        if: steps.bootstrap.outputs.ready == 'true'
-        with:
-          persist-credentials: false
       - uses: hashicorp/setup-terraform@v3
-        if: steps.bootstrap.outputs.ready == 'true'
         with:
           terraform_wrapper: false
-      - name: Authenticate apply role using OIDC
-        if: steps.bootstrap.outputs.ready == 'true'
+      - name: Assume dev apply role via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
-          role-to-assume: ${{ vars.DA_INFRA_APPLY_ROLE_ARN_DEV }}
+          aws-region: ${{ env.DA_AWS_REGION }}
+          role-to-assume: ${{ env.DA_INFRA_APPLY_ROLE_ARN_DEV }}
           audience: sts.amazonaws.com
-      - name: Format, initialize, validate, plan, enforce policy and apply (infra/dev)
-        if: steps.bootstrap.outputs.ready == 'true'
-        env:
-          REGION: ${{ vars.DA_AWS_REGION }}
-          STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+      - name: Format, initialize, validate, plan, enforce policy, apply saved plan (infra/dev)
+        shell: bash
         run: |
           set -euo pipefail
-          terraform -chdir=infra/dev fmt -check
-          terraform -chdir=infra/dev init -input=false -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$REGION"
-          terraform -chdir=infra/dev validate
-          if ! terraform -chdir=infra/dev plan -input=false -out=plan.tfplan > /tmp/notes-infra-plan.log 2>&1; then
-            echo 'Terraform plan failed (plan output withheld to protect values).' >&2
+          root=infra/dev
+          terraform -chdir="$root" fmt -check
+          terraform -chdir="$root" init -input=false -backend-config="bucket=${DA_STATE_BUCKET}" -backend-config="region=${DA_AWS_REGION}"
+          terraform -chdir="$root" validate
+          if ! terraform -chdir="$root" plan -input=false -out="$RUNNER_TEMP/dev.tfplan" > "$RUNNER_TEMP/plan.log" 2>&1; then
+            echo 'Terraform plan failed; no apply performed' >&2
             exit 1
           fi
-          terraform -chdir=infra/dev show -json plan.tfplan > plan.json
-          python3 infra/policy_check.py infra/dev infra/dev/plan.json
-          # Apply the same saved, policy-approved plan; do not replan after the check.
-          if ! terraform -chdir=infra/dev apply -input=false -auto-approve plan.tfplan > /tmp/notes-infra-apply.log 2>&1; then
-            echo 'Terraform apply failed (apply output withheld to protect values).' >&2
+          terraform -chdir="$root" show -json "$RUNNER_TEMP/dev.tfplan" > "$RUNNER_TEMP/dev.plan.json"
+          python3 infra/policy_check.py "$root" "$RUNNER_TEMP/dev.plan.json"
+          if ! terraform -chdir="$root" apply -input=false "$RUNNER_TEMP/dev.tfplan" > "$RUNNER_TEMP/apply.log" 2>&1; then
+            echo 'Terraform apply of the checked saved plan failed' >&2
             exit 1
           fi
-      - name: Remove local plan artifacts
-        if: always() && steps.bootstrap.outputs.ready == 'true'
-        run: rm -f infra/dev/plan.tfplan infra/dev/plan.json /tmp/notes-infra-plan.log /tmp/notes-infra-apply.log
