@@ -159,7 +159,8 @@ resource "aws_iam_role_policy" "deploy_dev" {
             "ecr:PutImage",
             "ecr:BatchGetImage",
             "ecr:GetDownloadUrlForLayer",
-            "ecr:DescribeImages"
+            "ecr:DescribeImages",
+            "ecr:ListImages"
           ],
           "Resource": [
             "arn:aws:ecr:ap-south-1:407493720885:repository/notes-app-f308"
@@ -377,7 +378,8 @@ resource "aws_iam_role" "infra_plan" {
           "Condition": {
             "StringEquals": {
               "token.actions.githubusercontent.com:sub": [
-                "repo:shubhamc01@327102562/notes-app@1404437167:pull_request"
+                "repo:shubhamc01@327102562/notes-app@1404437167:pull_request",
+                "repo:shubhamc01@327102562/notes-app@1404437167:ref:refs/heads/main"
               ]
             }
           }
