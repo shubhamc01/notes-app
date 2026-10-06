@@ -1,99 +1,70 @@
-name: Deploy
+# ENGINE-RENDERED by devops-agent (knowledge/delivery) — do not edit; regenerate instead.
+# Runs after CI passes on main; one job per environment, in promotion order. Every
+# infrastructure value is a repository secret (masked in every log line).
+name: "Deploy"
 on:
-  push:
-    branches: [main]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
   workflow_dispatch:
 permissions:
   contents: read
   id-token: write
 concurrency:
-  group: notes-app-dev-deploy
+  group: "Deploy"
   cancel-in-progress: false
 jobs:
   dev:
-    runs-on: ubuntu-latest
-    environment: dev
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    environment: "dev"
+    defaults:
+      run:
+        working-directory: "."
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      DEPLOY_ENV: "dev"
+      ROLE: ${{ secrets.DA_DEPLOY_ROLE_ARN_DEV }}
+      AWS_REGION: ${{ secrets.DA_AWS_REGION }}
+      INSTANCE: ${{ secrets.DA_HOST_INSTANCE_ID_DEV }}
+      HOST_URL: ${{ secrets.DA_HOST_URL_DEV }}
+      DOMAINS: ${{ secrets.DA_SITE_DOMAINS_DEV }}
+      REGISTRY: ${{ secrets.DA_ECR_REPOSITORY_URL }}
     steps:
-      - name: Mask bindings and check infrastructure
-        env:
-          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
-          DA_DEPLOY_ROLE_ARN_DEV: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
-          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          DA_HOST_INSTANCE_ID_DEV: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
-          DA_HOST_IP_DEV: ${{ vars.DA_HOST_IP_DEV }}
-          DA_HOST_URL_DEV: ${{ vars.DA_HOST_URL_DEV }}
-          DA_SITE_DOMAINS_DEV: ${{ vars.DA_SITE_DOMAINS_DEV }}
+      - name: Check the infrastructure is applied
         run: |
-          set -euo pipefail
-          for value in "$DA_AWS_REGION" "$DA_DEPLOY_ROLE_ARN_DEV" "$DA_ECR_REPOSITORY_URL" "$DA_HOST_INSTANCE_ID_DEV" "$DA_HOST_IP_DEV" "$DA_HOST_URL_DEV" "$DA_SITE_DOMAINS_DEV"; do
-            if [[ -n "$value" ]]; then echo "::add-mask::$value"; fi
+          missing=""
+          for name in ROLE AWS_REGION INSTANCE HOST_URL REGISTRY; do
+            [ -n "${!name}" ] || missing="$missing $name"
           done
-          for value in "$DA_AWS_REGION" "$DA_DEPLOY_ROLE_ARN_DEV" "$DA_ECR_REPOSITORY_URL" "$DA_HOST_INSTANCE_ID_DEV" "$DA_HOST_IP_DEV" "$DA_HOST_URL_DEV"; do
-            if [[ -z "$value" ]]; then echo 'infrastructure not applied yet' >&2; exit 1; fi
-          done
+          if [ -n "$missing" ]; then
+            echo "::error::infrastructure not applied yet (missing:$missing) — run devops-agent up"
+            exit 1
+          fi
       - uses: actions/checkout@v7
-      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
-          role-to-assume: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
-          audience: sts.amazonaws.com
+          ref: ${{ env.SHA }}
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
-      - name: Build and push immutable application and bundle images
-        env:
-          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          SHA: ${{ github.sha }}
+      - name: Build and push the release images (immutable tags)
         run: |
-          set -euo pipefail
-          repository="${DA_ECR_REPOSITORY_URL##*/}"
-          registry="${DA_ECR_REPOSITORY_URL%%/*}"
-          aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
-          for service in api web bundle; do
-            tag="${service}-${SHA}"
-            if aws ecr describe-images --repository-name "$repository" --image-ids "imageTag=$tag" >/dev/null 2>&1; then
-              continue
+          registry_host="${REGISTRY%%/*}"
+          repository="${REGISTRY#*/}"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$registry_host"
+          push() {
+            tag="$1"; shift
+            if aws ecr describe-images --region "$AWS_REGION" --repository-name "$repository" --image-ids "imageTag=$tag" >/dev/null 2>&1; then
+              echo "$tag already pushed"; return 0
             fi
-            case "$service" in
-              api) docker build -t "${DA_ECR_REPOSITORY_URL}:$tag" . ;;
-              web) docker build -t "${DA_ECR_REPOSITORY_URL}:$tag" ./web ;;
-              bundle) docker build -f deploy/Dockerfile.bundle -t "${DA_ECR_REPOSITORY_URL}:$tag" . ;;
-            esac
-            docker push "${DA_ECR_REPOSITORY_URL}:$tag"
-          done
-      - name: Deploy and wait for SSM result
-        env:
-          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
-          DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          DA_HOST_INSTANCE_ID_DEV: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
-          DA_HOST_IP_DEV: ${{ vars.DA_HOST_IP_DEV }}
-          DA_HOST_URL_DEV: ${{ vars.DA_HOST_URL_DEV }}
-          DA_SITE_DOMAINS_DEV: ${{ vars.DA_SITE_DOMAINS_DEV }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, shlex
-          names = ['DA_AWS_REGION', 'DA_ECR_REPOSITORY_URL', 'DA_HOST_IP_DEV', 'DA_HOST_URL_DEV', 'DA_SITE_DOMAINS_DEV']
-          exports = [f'export {name}={shlex.quote(os.environ[name])}' for name in names]
-          exports += [f'export IMAGE_TAG={shlex.quote(os.environ["SHA"])}', 'export DEPLOY_ENV=dev']
-          script = '\n'.join(['set -eu', *exports, 'registry="${DA_ECR_REPOSITORY_URL%%/*}"',
-              'aws ecr get-login-password --region "$DA_AWS_REGION" | docker login --username AWS --password-stdin "$registry"',
-              'docker pull "$DA_ECR_REPOSITORY_URL:bundle-$IMAGE_TAG"',
-              'mkdir -p /opt/app', 'id=$(docker create "$DA_ECR_REPOSITORY_URL:bundle-$IMAGE_TAG" noop)',
-              'trap "docker rm -f $id >/dev/null" EXIT', 'docker cp "$id:/app/." /opt/app/',
-              'docker rm "$id" >/dev/null', 'trap - EXIT', 'cd /opt/app',
-              'bash ./deploy/deploy.sh'])
-          with open('ssm-parameters.json', 'w') as f:
-              json.dump({'commands': [script], 'executionTimeout': ['3600']}, f)
-          PY
-          trap 'rm -f ssm-parameters.json' EXIT
-          command_id=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$DA_HOST_INSTANCE_ID_DEV" --parameters file://ssm-parameters.json --timeout-seconds 600 --query 'Command.CommandId' --output text)
-          for _ in {1..120}; do
-            sleep 30
-            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$DA_HOST_INSTANCE_ID_DEV" --query Status --output text 2>/dev/null || true)
-            case "$status" in
-              Success) echo 'Deployment healthy'; exit 0 ;;
-              Failed|Cancelled|TimedOut|Cancelling) echo "SSM deployment failed: $status (command $command_id)" >&2; exit 1 ;;
-            esac
-          done
-          echo "SSM deployment timed out: $command_id" >&2
-          exit 1
+            docker build --pull -t "$REGISTRY:$tag" "$@"
+            docker push "$REGISTRY:$tag"
+          }
+          push "api-$SHA" -f Dockerfile .
+          push "web-$SHA" -f web/Dockerfile web
+          push "bundle-$SHA" -f deploy/Dockerfile.bundle .
+      - name: Deploy on the host (SSM Run Command)
+        run: bash deploy/ci/ssm-deploy.sh

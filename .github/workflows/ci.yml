@@ -1,34 +1,28 @@
-name: CI
+# ENGINE-RENDERED by devops-agent (knowledge/delivery) — do not edit; regenerate instead.
+# Pull requests run everything a release needs except the cloud: the app's own install/lint/test/build
+# and a real build of every image and of the release bundle — a broken release fails here, before merge.
+name: "CI"
 on:
-  push:
-    branches: [main]
   pull_request:
+  push:
+    branches: ["main"]
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: "CI-${{ github.ref }}"
+  cancel-in-progress: true
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  images:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: "."
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.14'
-          cache: pip
-      - name: Install dependencies and CI tools
-        run: |
-          python -m pip install -r requirements.txt
-          python -m pip install pytest ruff
-      - name: Lint
-        run: ruff check .
-      - name: Test
-        run: python -m pytest
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build API image
-        run: docker build -t notes-app-api:${{ github.sha }} .
-      - name: Build web image
-        run: docker build -t notes-app-web:${{ github.sha }} ./web
+      - name: "build image api"
+        run: "docker build --pull -f Dockerfile ."
+      - name: "build image web"
+        run: "docker build --pull -f web/Dockerfile web"
+      - name: build the release bundle
+        run: docker build -f deploy/Dockerfile.bundle .

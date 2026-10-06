@@ -1,127 +1,118 @@
 #!/usr/bin/env bash
+# ENGINE-RENDERED by devops-agent (knowledge/delivery) — do not edit; regenerate instead.
+# Runs ON THE HOST (root, via SSM) from /opt/app after the bundle of release $SHA was unpacked.
 set -Eeuo pipefail
-umask 077
-cd /opt/app
-: "${DEPLOY_ENV:?}" "${IMAGE_TAG:?}" "${DA_ECR_REPOSITORY_URL:?}" "${DA_HOST_URL_DEV:?}" "${DA_HOST_IP_DEV:?}"
-[[ "$DEPLOY_ENV" == dev && "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid deployment identifier' >&2; exit 1; }
-export IMAGE_TAG DA_ECR_REPOSITORY_URL
+: "${DEPLOY_ENV:?}" "${SHA:?}" "${AWS_REGION:?}" "${REGISTRY:?}"
+DOMAINS="${DOMAINS:-}"
+cd "${APP_DIR:-/opt/app}"
+export REGISTRY IMAGE_TAG="$SHA"
 compose() { docker compose -f docker-compose.prod.yml "$@"; }
-mkdir -p /etc/letsencrypt deploy/nginx
-[[ -f deploy/nginx/http.conf && -f deploy/nginx/https.conf ]] || { echo 'Platform nginx configuration missing' >&2; exit 1; }
-# The host and its named database volume are a single failure domain. Scaling requires a new architecture.
-previous=''
-[[ ! -f .image-tag ]] || previous=$(cat .image-tag)
-backup=$(mktemp -d)
-for f in api.env db.env web.env deploy/nginx/active.conf; do
-  [[ ! -f "$f" ]] || { mkdir -p "$backup/$(dirname "$f")"; cp -p "$f" "$backup/$f"; }
-done
+previous="$(cat .release 2>/dev/null || true)"
+
 rollback() {
-  code=$?
+  local code=$?
   trap - ERR
-  echo "Deployment failed (exit $code); restoring previous release" >&2
-  if [[ -n "$previous" ]]; then
-    for f in api.env db.env web.env deploy/nginx/active.conf; do
-      [[ ! -f "$backup/$f" ]] || cp -p "$backup/$f" "$f"
-    done
-    IMAGE_TAG=$previous
-    export IMAGE_TAG
-    compose up -d --wait --wait-timeout 300 || echo 'Rollback also failed; operator intervention required' >&2
-    compose exec -T proxy nginx -s reload || true
+  echo "release ${SHA:0:12} failed (exit $code)" >&2
+  if [ -n "$previous" ] && [ "$previous" != "$SHA" ]; then
+    echo "rolling back to ${previous:0:12}" >&2
+    IMAGE_TAG="$previous" compose up -d --remove-orphans --wait --wait-timeout 300 || echo "rollback failed too" >&2
   else
-    echo 'No previous release exists; manual recovery required' >&2
+    echo "no earlier release on this host to roll back to" >&2
   fi
-  rm -rf "$backup"
   exit "$code"
 }
 trap rollback ERR
-# Fetch from the instance profile, never from the CI environment or image layers.
-python3 - "$DEPLOY_ENV" <<'PY'
-import json
-import os
-import pathlib
-import re
-import subprocess
-import sys
 
-env = sys.argv[1]
-for service, required in {
-    'web': set(),
-    'api': {'DB_HOST', 'DB_NAME', 'DB_PASSWORD', 'DB_USER'},
-    'db': {'MYSQL_DATABASE', 'MYSQL_PASSWORD', 'MYSQL_RANDOM_ROOT_PASSWORD', 'MYSQL_USER'},
-}.items():
-    prefix = f'/notes-app-f308/{env}/{service}/'
-    args = ['aws', 'ssm', 'get-parameters-by-path', '--with-decryption', '--recursive', '--path', prefix, '--output', 'json']
-    values = {}
-    token = None
-    while True:
-        cmd = args + (['--next-token', token] if token else [])
-        result = json.loads(subprocess.check_output(cmd, stderr=subprocess.DEVNULL))
-        for parameter in result.get('Parameters', []):
-            name = parameter['Name']
-            key = name[len(prefix):]
-            if not name.startswith(prefix) or '/' in key or not re.fullmatch(r'[A-Z][A-Z0-9_]*', key):
-                raise SystemExit('Unexpected parameter name')
-            if key not in required or key in values:
-                raise SystemExit('Unexpected or duplicate parameter for ' + service)
-            value = parameter['Value']
-            if '\n' in value or '\r' in value or '\x00' in value:
-                raise SystemExit('Multiline environment value not supported')
-            values[key] = value
-        token = result.get('NextToken')
-        if not token:
-            break
-    if values.keys() != required:
-        raise SystemExit('Missing required parameters for ' + service)
-    dest = pathlib.Path('/opt/app') / (service + '.env')
-    temp = dest.with_suffix('.env.tmp')
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, 'w') as output:
-            for key in sorted(values):
-                output.write(key + '=' + values[key] + '\n')
-        os.replace(temp, dest)
-    finally:
-        temp.unlink(missing_ok=True)
+# 1. config: one env file per service, from SSM (and the managed database), mode 600
+python3 - "$PWD" <<'PY'
+import json, os, subprocess, sys, urllib.parse
+
+# Config values from SSM (/<app>/<env>/<service>/<KEY>), plus a managed database's endpoint and
+# credentials (its Secrets Manager secret) for the keys the platform provides. Nothing is guessed:
+# a key the app reads that has no value stops the deploy with the exact list to set.
+env, region = os.environ["DEPLOY_ENV"], os.environ["AWS_REGION"]
+services = json.loads("{\"web\": [], \"api\": [\"DB_HOST\", \"DB_NAME\", \"DB_PASSWORD\", \"DB_USER\"], \"db\": [\"MYSQL_DATABASE\", \"MYSQL_PASSWORD\", \"MYSQL_RANDOM_ROOT_PASSWORD\", \"MYSQL_USER\"]}")   # service -> the keys its code reads
+provides = json.loads("{}")   # service -> {kind: [keys]} filled from the managed database
+db = json.loads("null")               # {"name", "scheme", "port"} of the managed database, or None
+dest = sys.argv[1]                   # where the <service>.env files go
+
+
+def aws(*args):
+    return json.loads(subprocess.run(["aws", *args, "--region", region, "--output", "json"],
+                                     check=True, capture_output=True, text=True).stdout or "null")
+
+
+managed = {}
+if db and os.environ.get("DB_SECRET_ARN"):
+    secret = json.loads(aws("secretsmanager", "get-secret-value", "--secret-id", os.environ["DB_SECRET_ARN"],
+                            "--query", "SecretString"))
+    user, password = secret["username"], secret["password"]
+    host = os.environ["DB_ENDPOINT"]
+    managed = {"host": host, "port": str(db["port"]), "username": user, "password": password, "name": db["name"],
+               "url": f"{db['scheme']}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}"
+                      f"@{host}:{db['port']}/{db['name']}"}
+
+missing = []
+for service, keys in services.items():
+    stored = aws("ssm", "get-parameters-by-path", "--recursive", "--with-decryption",
+                 "--path", f"/notes-app-f308/{env}/{service}/", "--query", "Parameters[].[Name,Value]") or []
+    values = {name.rsplit("/", 1)[1]: value for name, value in stored}
+    for kind, kind_keys in (provides.get(service) or {}).items():
+        for key in kind_keys:
+            if kind in managed:
+                values[key] = managed[kind]
+    missing += [f"{service}/{key}" for key in keys if key not in values]
+    lines = []
+    for key in sorted(values):
+        value = values[key]
+        if "\n" in value or "\r" in value:
+            sys.exit(f"{service}/{key}: multi-line values are not supported in env files")
+        # single quotes = literal in compose env files and systemd EnvironmentFile alike
+        lines.append(f"{key}='{value}'" if "'" not in value else
+                     key + '="' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"')
+    path = os.path.join(dest, f"{service}.env")
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(path + ".tmp", path)
+if missing:
+    sys.exit("missing config values (set them with `devops-agent apply`): " + ", ".join(missing))
+
 PY
-chmod 600 web.env api.env db.env
+
+# 2. registry login, pull every image of this release
+aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "${REGISTRY%%/*}" >/dev/null
+compose pull --quiet
+
+# 3. proxy config: plain HTTP until a certificate exists for the domain(s)
 cp deploy/nginx/http.conf deploy/nginx/active.conf
-compose pull web api db proxy certbot
-if [[ -n "${DA_SITE_DOMAINS_DEV:-}" && ! -d /etc/letsencrypt/live/app ]]; then
-  # Validate DNS before requesting a certificate; names must already point at this VM.
-  mapfile -t domains < <(printf '%s' "$DA_SITE_DOMAINS_DEV" | tr ', ' '\n\n' | sed '/^$/d')
-  [[ ${#domains[@]} -gt 0 ]] || { echo 'No usable site domains' >&2; false; }
-  for domain in "${domains[@]}"; do
-    if ! python3 - "$domain" "$DA_HOST_IP_DEV" <<'PY'
-import socket
-import sys
-try:
-    addresses = {item[4][0] for item in socket.getaddrinfo(sys.argv[1], None)}
-    sys.exit(0 if sys.argv[2] in addresses else 1)
-except socket.gaierror:
-    sys.exit(1)
-PY
-    then
-      echo 'Domain does not resolve to DA_HOST_IP_DEV yet; configure DNS before deploying' >&2
-      false
-    fi
-  done
-  compose up -d proxy
+if [ -n "$DOMAINS" ] && ! compose run --rm --no-deps --entrypoint test certbot -d /etc/letsencrypt/live/app; then
+  compose up -d --no-deps proxy
   args=()
-  for domain in "${domains[@]}"; do args+=(-d "$domain"); done
-  compose run --rm --no-deps --entrypoint certbot certbot certonly --webroot -w /var/www/certbot --cert-name app "${args[@]}" --agree-tos --register-unsafely-without-email --non-interactive
+  for d in ${DOMAINS//,/ }; do args+=(-d "$d"); done
+  compose run --rm --no-deps --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
+    --cert-name app "${args[@]}" --agree-tos --register-unsafely-without-email --non-interactive
 fi
-if [[ -d /etc/letsencrypt/live/app ]]; then
-  cp deploy/nginx/https.conf deploy/nginx/active.conf
-elif [[ -n "${DA_SITE_DOMAINS_DEV:-}" ]]; then
-  echo 'Certificate issuance failed' >&2
-  false
-fi
-# --wait checks every routed service locally; the last request checks the actual proxy path.
-compose up -d --wait --wait-timeout 300
+if [ -n "$DOMAINS" ]; then cp deploy/nginx/https.conf deploy/nginx/active.conf; fi
+
+# 4. start: --wait = every service with a healthcheck (datastores, images that declare one) is healthy
+compose up -d --remove-orphans --wait --wait-timeout 300
 compose exec -T proxy nginx -s reload
-status=$(curl --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' "${DA_HOST_URL_DEV%/}/")
-if (( 10#$status >= 500 || 10#$status < 100 )); then echo 'Proxy returned an unhealthy response' >&2; false; fi
-printf '%s\n' "$IMAGE_TAG" > .image-tag
-rm -rf "$backup"
+
+# 5. every route answers through the proxy (an upstream that is down = 0/502/503/504)
+down=" 0 502 503 504 "
+probe() {
+  local path="$1" host="$2" code=000
+  for _ in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 ${host:+-H "Host: $host"} "http://127.0.0.1$path" || true)
+    case "$down" in *" $((10#$code)) "*) sleep 5 ;; *) echo "route $path answers ($code)"; return 0 ;; esac
+  done
+  echo "route $path is not served (last answer $code)" >&2
+  return 1
+}
+probe "/" ""
+probe "/api" ""
+
+echo "$SHA" > .release
 trap - ERR
-echo 'Deployment healthy'
+echo "release ${SHA:0:12} is live on $DEPLOY_ENV"

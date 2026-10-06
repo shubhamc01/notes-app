@@ -1,5 +1,6 @@
 {
   "files": {
+    "deploy/Dockerfile.bundle": "e63b22babc61c0608a998ab7a2ff7a832af66f041dd6ec8a6d170e221a0de84c",
     "deploy/nginx/http.conf": "622ce34c9ae03f267ac95052fef58d7e6fed6926c31208f3619c47019a3a4524",
     "deploy/nginx/https.conf": "5712cbc204defd7d3b281a0d0e0d4b09e39d1f453aeecc66bbd66c21fa8aee7f",
     "infra/bootstrap/main.tf": "fa54a310ae348d7415369c1eece9f39de1a7b56677b75ebbd93baf2ecb83edb6",
