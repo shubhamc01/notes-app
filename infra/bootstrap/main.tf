@@ -415,9 +415,17 @@ resource "aws_iam_role_policy" "infra_plan" {
         {
           "Effect": "Deny",
           "Action": [
+            "ssm:GetParameter*"
+          ],
+          "NotResource": [
+            "arn:aws:ssm:*::parameter/aws/service/*"
+          ]
+        },
+        {
+          "Effect": "Deny",
+          "Action": [
             "secretsmanager:GetSecretValue",
             "kms:Decrypt",
-            "ssm:GetParameter*",
             "dynamodb:GetItem",
             "dynamodb:BatchGetItem",
             "dynamodb:Scan",

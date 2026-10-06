@@ -72,6 +72,11 @@ resource "aws_iam_role_policy" "host_runtime" {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = local.secret_arns
+      }] : [],
+      length(local.artifact_read_arns) > 0 ? [{
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = local.artifact_read_arns
       }] : []
     )
   })
