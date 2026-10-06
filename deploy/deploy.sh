@@ -1,172 +1,138 @@
 #!/usr/bin/env bash
+# Run as root on the SSM-managed host with Docker Compose, AWS CLI, curl and Python 3.
+# A single VM has no HA or automatic scaling; persist database and certificates in volumes.
 set -Eeuo pipefail
-
-# Executed on the EC2 host through SSM. The host uses its instance profile for
-# ECR and SSM access; no static AWS credentials are used. EC2 is a single point
-# of failure with manual-only scaling; this target is unsuitable where HA or
-# elastic scaling is required. Keep durable container data in named volumes.
-APP_DIR=/opt/app
-COMPOSE_FILE=docker-compose.prod.yml
-ENVIRONMENT=${1:?usage: deploy.sh <environment> <image-tag> <region> <ecr-url> <host-url> <host-ip> <domains>}
-IMAGE_TAG=${2:?missing image tag}
-AWS_REGION=${3:?missing AWS region}
-ECR_REPOSITORY_URL=${4:?missing ECR repository URL}
-HOST_URL=${5:?missing host URL}
-HOST_IP=${6:?missing host IP}
-SITE_DOMAINS=${7:-}
-
-case "$ENVIRONMENT" in
-  dev|prod) ;;
-  *) echo "Unsupported environment: $ENVIRONMENT" >&2; exit 2 ;;
-esac
-[[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid image tag" >&2; exit 2; }
-[[ "$ECR_REPOSITORY_URL" == */* ]] || { echo "Invalid ECR repository URL" >&2; exit 2; }
-[[ "$HOST_URL" == https://* || "$HOST_URL" == http://* ]] || { echo "Invalid host URL" >&2; exit 2; }
-
-cd "$APP_DIR"
-chmod 700 "$APP_DIR"
-mkdir -p deploy/nginx
-
-# Emit only the contractually allowed parameter names. Values are never logged,
-# and env files are private to root. An empty web.env is intentional.
-write_service_env() {
-  local service=$1
-  shift
-  local path="/notes-app-f308/${ENVIRONMENT}/${service}/"
-  local response
-  response=$(aws ssm get-parameters-by-path \
-    --region "$AWS_REGION" --with-decryption --recursive \
-    --path "$path" --output json)
-  SERVICE_NAME="$service" ALLOWED_KEYS="$*" PARAMETER_JSON="$response" python3 - <<'PY'
+umask 077
+if (( $# != 6 )); then
+  echo 'usage: deploy.sh <env> <sha> <ecr-repository-url> <host-url> <host-ip> <domains>' >&2
+  exit 2
+fi
+environment=$1
+new_tag=$2
+registry=$3
+host_url=${4%/}
+host_ip=$5
+domains=$6
+if [[ ! $environment =~ ^[a-z][a-z0-9_-]*$ || ! $new_tag =~ ^[0-9a-f]{40}$ || ! $registry =~ ^[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9_./-]+$ || ! $host_url =~ ^https?://[^/[:space:]]+$ || ! $host_ip =~ ^[0-9.]+$ ]]; then
+  echo 'invalid deployment arguments' >&2
+  exit 2
+fi
+cd /opt/app
+compose=(docker compose --env-file .release.env -f docker-compose.prod.yml)
+previous_tag=''
+previous_registry=''
+if [[ -f .release.env ]]; then
+  previous_tag=$(sed -n 's/^IMAGE_TAG=//p' .release.env)
+  previous_registry=$(sed -n 's/^DA_ECR_REPOSITORY_URL=//p' .release.env)
+fi
+# Retain the last image/tag, configuration and env files until the new proxy is healthy.
+backup=$(mktemp -d /opt/app/.rollback.XXXXXXXX)
+for file in .release.env web.env api.env db.env deploy/nginx/active.conf; do
+  if [[ -f $file ]]; then
+    mkdir -p "$backup/$(dirname "$file")"
+    cp -p "$file" "$backup/$file"
+  fi
+done
+changed=false
+rollback() {
+  local status=$?
+  trap - ERR EXIT
+  if (( status == 0 )); then
+    rm -rf "$backup"
+    return
+  fi
+  echo "deployment failed (exit $status); restoring prior release" >&2
+  for file in .release.env web.env api.env db.env deploy/nginx/active.conf; do
+    if [[ -f $backup/$file ]]; then
+      cp -p "$backup/$file" "$file"
+    fi
+  done
+  if [[ $changed == true && -n $previous_tag && -n $previous_registry ]]; then
+    "${compose[@]}" up -d --remove-orphans >&2 || true
+    "${compose[@]}" exec -T proxy nginx -s reload >&2 || true
+  else
+    echo 'no previous release to restore; manual recovery may be needed' >&2
+  fi
+  rm -rf "$backup"
+  exit "$status"
+}
+trap rollback ERR EXIT
+# Never print decrypted SSM values or put them on a command line.
+python3 - "$environment" <<'PY'
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
-service = os.environ["SERVICE_NAME"]
-allowed = set(os.environ["ALLOWED_KEYS"].split())
-parameters = json.loads(os.environ["PARAMETER_JSON"]).get("Parameters", [])
-values = {}
-for parameter in parameters:
-    key = parameter["Name"].rstrip("/").split("/")[-1]
-    if key in allowed:
-        values[key] = parameter["Value"]
-missing = allowed - values.keys()
-if missing:
-    raise SystemExit(f"Missing required SSM parameters for {service}: {', '.join(sorted(missing))}")
-content = "".join(
-    f"{key}={json.dumps(values[key], ensure_ascii=False).replace('$', '$$')}\n"
-    for key in sorted(allowed)
-)
-path = Path(f"/opt/app/{service}.env")
-path.write_text(content, encoding="utf-8")
-path.chmod(0o600)
+env = sys.argv[1]
+required = {
+    'web': set(),
+    'api': {'DB_HOST', 'DB_NAME', 'DB_PASSWORD', 'DB_USER'},
+    'db': {'MYSQL_DATABASE', 'MYSQL_PASSWORD', 'MYSQL_RANDOM_ROOT_PASSWORD', 'MYSQL_USER'},
+}
+for service, keys in required.items():
+    path = f'/notes-app-f308/{env}/{service}/'
+    output = subprocess.check_output([
+        'aws', 'ssm', 'get-parameters-by-path', '--with-decryption',
+        '--path', path, '--output', 'json',
+    ])
+    values = {}
+    for parameter in json.loads(output)['Parameters']:
+        name = parameter['Name']
+        key = name.rsplit('/', 1)[-1]
+        if name != path + key or key not in keys or key in values:
+            raise SystemExit(f'unexpected SSM parameter for {service}')
+        value = parameter['Value']
+        if '\n' in value or '\r' in value or '\x00' in value:
+            raise SystemExit(f'invalid SSM parameter value for {service}')
+        values[key] = value
+    if set(values) != keys or any(not values[key] for key in keys):
+        raise SystemExit(f'missing required SSM parameters for {service}')
+    temporary = Path(f'{service}.env.tmp')
+    fd = os.open(temporary, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as file:
+        for key in sorted(values):
+            file.write(f'{key}={values[key]}\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, Path(f'{service}.env'))
 PY
-}
-
-write_service_env web
-write_service_env api DB_HOST DB_NAME DB_PASSWORD DB_USER
-write_service_env db MYSQL_DATABASE MYSQL_PASSWORD MYSQL_RANDOM_ROOT_PASSWORD MYSQL_USER
-
-# The nginx files are platform-maintained, not generated by this deploy.
+printf 'DA_ECR_REPOSITORY_URL=%s\nIMAGE_TAG=%s\n' "$registry" "$new_tag" > .release.env
+chmod 600 .release.env
+changed=true
+"${compose[@]}" pull web api db proxy certbot
+# nginx templates are platform-managed; select only on the host at deploy time.
 cp deploy/nginx/http.conf deploy/nginx/active.conf
-chmod 644 deploy/nginx/active.conf
-
-export AWS_REGION ECR_REPOSITORY_URL IMAGE_TAG
-compose() {
-  docker compose --env-file /dev/null -f "$COMPOSE_FILE" "$@"
+cert_exists() {
+  "${compose[@]}" run --rm --no-deps --entrypoint /bin/sh certbot -c 'test -f /etc/letsencrypt/live/app/fullchain.pem && test -f /etc/letsencrypt/live/app/privkey.pem' >/dev/null
 }
-
-previous_tag=""
-if [[ -f .current-image-tag ]]; then
-  previous_tag=$(<.current-image-tag)
-elif [[ -f .previous-image-tag ]]; then
-  previous_tag=$(<.previous-image-tag)
-fi
-
-rollback() {
-  local status=$?
-  trap - ERR
-  if [[ -n "$previous_tag" && "$previous_tag" != "$IMAGE_TAG" ]]; then
-    echo "Deployment failed; rolling back to image tag $previous_tag." >&2
-    IMAGE_TAG=$previous_tag
-    export IMAGE_TAG
-    compose pull web api || true
-    compose up -d || true
-    compose exec -T proxy nginx -s reload || true
-    if ! curl --fail --silent --show-error --max-time 10 "${HOST_URL%/}/healthz"; then
-      echo "Rollback was attempted but the health endpoint is still failing." >&2
+if [[ -n $domains ]] && ! cert_exists; then
+  domain_list=()
+  domains=${domains//,/ }
+  for domain in $domains; do
+    if [[ ! $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+      echo "invalid site domain: $domain" >&2
+      exit 1
     fi
-  else
-    echo "Deployment failed and no previous image tag is available for rollback." >&2
-  fi
-  exit "$status"
-}
-
-# Confirm DNS before certificate issuance, and accept any matching resolved
-# address rather than depending on DNS answer ordering.
-if [[ -n "$SITE_DOMAINS" ]]; then
-  IFS=',' read -r -a domains <<< "$SITE_DOMAINS"
-  cert_exists=0
-  if compose exec -T certbot test -s /etc/letsencrypt/live/app/fullchain.pem >/dev/null 2>&1; then
-    cert_exists=1
-  fi
-  if (( ! cert_exists )); then
-    for domain in "${domains[@]}"; do
-      domain=${domain//[[:space:]]/}
-      [[ -n "$domain" ]] || continue
-      if ! getent ahostsv4 "$domain" | awk -v wanted="$HOST_IP" '$1 == wanted { found=1 } END { exit !found }'; then
-        resolved=$(getent ahostsv4 "$domain" | awk '{print $1}' | sort -u | paste -sd, - || true)
-        echo "Certificate issuance stopped: $domain must resolve to $HOST_IP (currently ${resolved:-unresolved}). Update DNS and retry." >&2
-        exit 1
-      fi
-    done
-    compose up -d proxy certbot
-    certbot_args=(certbot certonly --webroot -w /var/www/certbot --cert-name app)
-    for domain in "${domains[@]}"; do
-      domain=${domain//[[:space:]]/}
-      [[ -n "$domain" ]] && certbot_args+=(-d "$domain")
-    done
-    certbot_args+=(--agree-tos --register-unsafely-without-email --non-interactive)
-    compose exec -T certbot "${certbot_args[@]}"
-  fi
-  if compose exec -T certbot test -s /etc/letsencrypt/live/app/fullchain.pem; then
-    cp deploy/nginx/https.conf deploy/nginx/active.conf
-    chmod 644 deploy/nginx/active.conf
-  else
-    echo "Certificate was not created at /etc/letsencrypt/live/app; refusing HTTPS deployment." >&2
-    exit 1
-  fi
-elif compose exec -T certbot test -s /etc/letsencrypt/live/app/fullchain.pem >/dev/null 2>&1; then
-  cp deploy/nginx/https.conf deploy/nginx/active.conf
-  chmod 644 deploy/nginx/active.conf
-fi
-
-trap rollback ERR
-
-# Authenticate on-host with the EC2 instance role, then deploy the immutable SHA.
-registry=${ECR_REPOSITORY_URL%%/*}
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin "$registry"
-compose pull web api
-compose up -d
-compose exec -T proxy nginx -s reload
-
-attempt=0
-while (( attempt < 30 )); do
-  if curl --fail --silent --show-error --max-time 10 "${HOST_URL%/}/healthz"; then
-    if [[ -n "$previous_tag" && "$previous_tag" != "$IMAGE_TAG" ]]; then
-      printf '%s\n' "$previous_tag" > .previous-image-tag
-      chmod 600 .previous-image-tag
+    if ! getent ahostsv4 "$domain" | awk '{print $1}' | grep -Fxq "$host_ip"; then
+      echo "domain $domain does not resolve to expected host IP ($host_ip) yet; configure DNS before requesting a certificate" >&2
+      exit 1
     fi
-    printf '%s\n' "$IMAGE_TAG" > .current-image-tag
-    chmod 600 .current-image-tag
-    trap - ERR
-    echo "Deployment succeeded: $IMAGE_TAG"
+    domain_list+=(-d "$domain")
+  done
+  "${compose[@]}" up -d --no-deps proxy
+  "${compose[@]}" run --rm --no-deps --entrypoint certbot certbot certonly --webroot -w /var/www/certbot --cert-name app "${domain_list[@]}" --agree-tos --register-unsafely-without-email --non-interactive
+fi
+if cert_exists; then cp deploy/nginx/https.conf deploy/nginx/active.conf; fi
+"${compose[@]}" up -d --remove-orphans
+"${compose[@]}" exec -T proxy nginx -s reload
+# Test the public proxy, never an unpublished container port.
+for attempt in $(seq 1 30); do
+  if curl --fail --silent --show-error --max-time 5 "$host_url/healthz" >/dev/null 2>&1; then
+    echo "release $new_tag ready through proxy"
     exit 0
   fi
-  attempt=$((attempt + 1))
-  sleep 10
+  if (( attempt < 30 )); then sleep 5; fi
 done
-
-echo "Health check failed through proxy at ${HOST_URL%/}/healthz after 300 seconds." >&2
-false
+echo "proxy health endpoint failed: $host_url/healthz" >&2
+exit 1
