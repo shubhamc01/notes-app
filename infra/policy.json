@@ -2,7 +2,7 @@
   "files": {
     "deploy/nginx/http.conf": "622ce34c9ae03f267ac95052fef58d7e6fed6926c31208f3619c47019a3a4524",
     "deploy/nginx/https.conf": "5712cbc204defd7d3b281a0d0e0d4b09e39d1f453aeecc66bbd66c21fa8aee7f",
-    "infra/bootstrap/main.tf": "f2adaae5d821e57b0bf24189a1edfb8feaaf8519ff2d7586184289c7a7b7410a",
+    "infra/bootstrap/main.tf": "fa54a310ae348d7415369c1eece9f39de1a7b56677b75ebbd93baf2ecb83edb6",
     "infra/bootstrap/outputs.tf": "5b0db5e2b47bcfecc03d4b0a66c010563568c2ccd7b4f6d5f8f6b945cc8612a0",
     "infra/bootstrap/versions.tf": "448c9b0e9b6dc3dd394269fc3fea675ae0033c72cb559d0679c4b7705f170fba",
     "infra/dev/backend.tf": "ed14950e7d8c11e48dcca268fe43235db4a1fecdd52af073789ff3e3b47ce7f6",
