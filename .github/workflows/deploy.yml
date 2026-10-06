@@ -1,8 +1,7 @@
 name: Deploy
+
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
+  push:
     branches: [main]
   workflow_dispatch:
 
@@ -16,116 +15,117 @@ concurrency:
 
 jobs:
   dev:
-    # workflow_run must originate from a successful push in this repository.
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.ref == 'refs/heads/main'
     environment: dev
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
+      DA_DEPLOY_ROLE_ARN_DEV: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
+      DA_ECR_REPOSITORY_URL: ${{ vars.DA_ECR_REPOSITORY_URL }}
+      DA_HOST_INSTANCE_ID_DEV: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
+      DA_HOST_IP_DEV: ${{ vars.DA_HOST_IP_DEV }}
+      DA_HOST_URL_DEV: ${{ vars.DA_HOST_URL_DEV }}
+      DA_SITE_DOMAINS_DEV: ${{ vars.DA_SITE_DOMAINS_DEV }}
     steps:
-      - name: Check applied infrastructure
-        env:
-          REGION: ${{ vars.DA_AWS_REGION }}
-          ROLE: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
-          REGISTRY: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          INSTANCE: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
-          HOST_IP: ${{ vars.DA_HOST_IP_DEV }}
-          HOST_URL: ${{ vars.DA_HOST_URL_DEV }}
+      - name: Check applied infrastructure (before checkout or AWS)
+        shell: bash
         run: |
-          set -euo pipefail
-          for name in REGION ROLE REGISTRY INSTANCE HOST_IP HOST_URL; do
-            if [ -z "${!name}" ]; then
+          for name in DA_AWS_REGION DA_DEPLOY_ROLE_ARN_DEV DA_ECR_REPOSITORY_URL DA_HOST_INSTANCE_ID_DEV DA_HOST_IP_DEV DA_HOST_URL_DEV; do
+            if [[ -z "${!name:-}" ]]; then
               echo 'infrastructure not applied yet' >&2
               exit 1
             fi
           done
+          # An empty DA_SITE_DOMAINS_DEV is valid: serve HTTP until domains exist.
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-          persist-credentials: false
-      - name: Configure AWS via OIDC
+      - name: Assume dev deployment role via GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
-          role-to-assume: ${{ vars.DA_DEPLOY_ROLE_ARN_DEV }}
+          aws-region: ${{ env.DA_AWS_REGION }}
+          role-to-assume: ${{ env.DA_DEPLOY_ROLE_ARN_DEV }}
           audience: sts.amazonaws.com
-      - name: Build and publish immutable images
-        env:
-          REGISTRY: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          REGION: ${{ vars.DA_AWS_REGION }}
+      - name: Build and publish immutable service and bundle tags
+        shell: bash
         run: |
           set -euo pipefail
-          sha="$(git rev-parse HEAD)"
-          registry_host="${REGISTRY%%/*}"
-          repository="${REGISTRY#*/}"
-          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$registry_host"
-          for kind in app bundle; do
-            if [ "$kind" = app ]; then
-              tag="$sha"
-              file=Dockerfile
-            else
-              tag="bundle-$sha"
-              file=Dockerfile.bundle
+          registry="${DA_ECR_REPOSITORY_URL%/*}"
+          repository="${DA_ECR_REPOSITORY_URL##*/}"
+          aws ecr get-login-password --region "$DA_AWS_REGION" | docker login --username AWS --password-stdin "$registry"
+          for service in api web bundle; do
+            tag="${service}-${GITHUB_SHA}"
+            existing=$(aws ecr list-images --repository-name "$repository" --filter tagStatus=TAGGED --query "imageIds[?imageTag=='${tag}'].imageTag" --output text)
+            if [[ "$existing" == "$tag" ]]; then
+              echo "Existing immutable image tag: ${tag}; skipping build and push"
+              continue
             fi
-            if aws ecr describe-images --repository-name "$repository" --image-ids "imageTag=$tag" --region "$REGION" >/dev/null 2>&1; then
-              echo "Already published immutable tag: $tag"
-            else
-              docker build -f "$file" -t "$REGISTRY:$tag" .
-              docker push "$REGISTRY:$tag"
-            fi
-          done
-      - name: Deploy bundle on EC2 with SSM and wait for health
-        env:
-          REGISTRY: ${{ vars.DA_ECR_REPOSITORY_URL }}
-          REGION: ${{ vars.DA_AWS_REGION }}
-          INSTANCE: ${{ vars.DA_HOST_INSTANCE_ID_DEV }}
-          HOST_IP: ${{ vars.DA_HOST_IP_DEV }}
-          HOST_URL: ${{ vars.DA_HOST_URL_DEV }}
-          DOMAINS: ${{ vars.DA_SITE_DOMAINS_DEV }}
-        run: |
-          set -euo pipefail
-          DEPLOY_SHA="$(git rev-parse HEAD)"
-          export DEPLOY_SHA
-          python3 - <<'PY'
-          import json
-          import os
-          import shlex
-          from pathlib import Path
-
-          q = shlex.quote
-          registry = os.environ['REGISTRY']
-          sha = os.environ['DEPLOY_SHA']
-          region = os.environ['REGION']
-          host = registry.split('/', 1)[0]
-          args = ['dev', sha, registry, os.environ['HOST_URL'],
-                  os.environ['HOST_IP'], os.environ['DOMAINS']]
-          script = '\n'.join([
-              'set -eu',
-              'mkdir -p /opt/app',
-              f'aws ecr get-login-password --region {q(region)} | docker login --username AWS --password-stdin {q(host)}',
-              f'docker pull {q(registry + ":bundle-" + sha)}',
-              f'id=$(docker create {q(registry + ":bundle-" + sha)} noop)',
-              'trap \'docker rm "$id" >/dev/null 2>&1 || true\' EXIT',
-              'docker cp "$id:/app/." /opt/app/',
-              'docker rm "$id"',
-              'trap - EXIT',
-              'cd /opt/app',
-              './deploy/deploy.sh ' + ' '.join(map(q, args)),
-          ])
-          Path('ssm-request.json').write_text(json.dumps({'commands': [script]}))
-          PY
-          command_id="$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids "$INSTANCE" --timeout-seconds 1800 --parameters file://ssm-request.json --query 'Command.CommandId' --output text)"
-          rm -f ssm-request.json
-          for attempt in $(seq 1 180); do
-            status="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || true)"
-            case "$status" in
-              Success) echo "SSM deployment and proxy health check succeeded: $command_id"; exit 0 ;;
-              Failed|Cancelled|TimedOut) aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" --query '[StatusDetails,StandardErrorContent]' --output text >&2; exit 1 ;;
+            case "$service" in
+              api) docker build --tag "${DA_ECR_REPOSITORY_URL}:${tag}" . ;;
+              web) docker build --tag "${DA_ECR_REPOSITORY_URL}:${tag}" ./web ;;
+              bundle)
+                # Preserve deploy/ as a directory in the image; the host has no checkout.
+                # nginx configuration is platform-written on the host, not in this bundle.
+                docker build --file - --tag "${DA_ECR_REPOSITORY_URL}:${tag}" . <<'DOCKERFILE'
+          FROM scratch
+          COPY docker-compose.prod.yml /app/
+          COPY deploy/ /app/deploy/
+          DOCKERFILE
+                ;;
             esac
-            if [ "$attempt" -eq 180 ]; then break; fi
+            docker push "${DA_ECR_REPOSITORY_URL}:${tag}"
+          done
+      - name: Install bundle and deploy over SSM
+        shell: bash
+        timeout-minutes: 35
+        run: |
+          set -euo pipefail
+          # Quote workflow variables for the remote shell. No application secrets
+          # are included in the command; the host reads them from SSM at runtime.
+          printf -v q_region '%q' "$DA_AWS_REGION"
+          printf -v q_registry '%q' "$DA_ECR_REPOSITORY_URL"
+          printf -v q_host_url '%q' "$DA_HOST_URL_DEV"
+          printf -v q_host_ip '%q' "$DA_HOST_IP_DEV"
+          printf -v q_domains '%q' "$DA_SITE_DOMAINS_DEV"
+          printf -v q_sha '%q' "$GITHUB_SHA"
+          remote_script=$(cat <<SCRIPT
+          set -euo pipefail
+          export AWS_DEFAULT_REGION=$q_region
+          registry=$q_registry
+          bundle="\${registry}:bundle-$q_sha"
+          mkdir -p /opt/app
+          if [[ -f /opt/app/.env && -f /opt/app/docker-compose.prod.yml ]]; then
+            cp -f /opt/app/docker-compose.prod.yml /opt/app/docker-compose.prod.rollback.yml
+          fi
+          aws ecr get-login-password --region $q_region | docker login --username AWS --password-stdin "\${registry%/*}"
+          docker pull "\${bundle}"
+          id=\$(docker create "\${bundle}" noop)
+          trap 'docker rm -f "\$id" >/dev/null 2>&1 || true' EXIT
+          docker cp "\${id}:/app/." /opt/app/
+          docker rm "\${id}" >/dev/null
+          trap - EXIT
+          cd /opt/app
+          chmod +x ./deploy/deploy.sh
+          ./deploy/deploy.sh dev $q_sha $q_registry $q_host_url $q_host_ip $q_domains
+          SCRIPT
+          )
+          # AWS-RunShellScript runs as root on the instance. Its instance profile
+          # needs ECR pull and scoped SSM Parameter Store read permissions.
+          jq -n --arg command "$remote_script" '{commands: [$command], executionTimeout: ["1800"]}' > "$RUNNER_TEMP/ssm-parameters.json"
+          command_id=$(aws ssm send-command \
+            --instance-ids "$DA_HOST_INSTANCE_ID_DEV" \
+            --document-name AWS-RunShellScript \
+            --comment "notes-app dev ${GITHUB_SHA}" \
+            --parameters "file://$RUNNER_TEMP/ssm-parameters.json" \
+            --query 'Command.CommandId' --output text)
+          for ((attempt=0; attempt<180; attempt++)); do
+            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$DA_HOST_INSTANCE_ID_DEV" --query Status --output text 2>/dev/null || true)
+            case "$status" in
+              Success) echo "Deployment healthy: ${GITHUB_SHA}"; exit 0 ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                echo "SSM deployment failed (${status}); deploy.sh attempted rollback. Command: ${command_id}" >&2
+                exit 1 ;;
+            esac
             sleep 10
           done
-          echo "SSM deployment timed out: $command_id" >&2
+          echo "SSM deployment timed out; inspect command ${command_id}" >&2
           exit 1
