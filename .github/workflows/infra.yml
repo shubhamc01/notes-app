@@ -1,121 +1,95 @@
+# ENGINE-RENDERED by devops-agent (knowledge/delivery) — do not edit; regenerate instead.
+# Pull requests: plan every root read-only. Merge: plan first; only roots WITH changes go to the
+# approval-gated <env>-infra apply (a merge with nothing to change finishes green, no approval asked).
+# infra/bootstrap is never touched by CI (a human applies it with devops-agent).
 name: Infrastructure
 on:
   pull_request:
-    paths: ['infra/**', '.github/workflows/infra.yml']
+    paths: ["infra/**", ".github/workflows/infra.yml"]
   push:
-    branches: [main]
-    paths: ['infra/**', '.github/workflows/infra.yml']
+    branches: ["main"]
+    paths: ["infra/**", ".github/workflows/infra.yml"]
 permissions:
   contents: read
   id-token: write
+  pull-requests: read
 concurrency:
-  group: infra-${{ github.ref }}
+  group: infrastructure
   cancel-in-progress: false
+env:
+  AWS_REGION: ${{ secrets.DA_AWS_REGION }}
+  PLAN_ROLE: ${{ secrets.DA_INFRA_PLAN_ROLE_ARN }}
 jobs:
   plan:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
     outputs:
-      ready: ${{ steps.bindings.outputs.ready }}
-      dev_changed: ${{ steps.plan_dev.outputs.changed }}
+      dev: ${{ steps.plan.outputs.dev }}
     steps:
-      - name: Mask bindings and check bootstrap
-        id: bindings
-        env:
-          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
-          DA_INFRA_PLAN_ROLE_ARN: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
-          DA_STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
+      - name: Bootstrap applied?
+        id: ready
         run: |
-          for value in "$DA_AWS_REGION" "$DA_INFRA_PLAN_ROLE_ARN" "$DA_STATE_BUCKET"; do
-            if [[ -n "$value" ]]; then echo "::add-mask::$value"; fi
-          done
-          if [[ -z "$DA_AWS_REGION" || -z "$DA_INFRA_PLAN_ROLE_ARN" ]]; then
-            echo 'infrastructure bootstrap not applied yet — run devops-agent up (or apply) first'
-            echo 'ready=false' >> "$GITHUB_OUTPUT"
+          if [ -z "$PLAN_ROLE" ] || [ -z "$AWS_REGION" ]; then
+            echo "::notice::infrastructure bootstrap not applied yet — run devops-agent up (or apply) first"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
           else
-            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v7
-        if: steps.bindings.outputs.ready == 'true'
-      - uses: hashicorp/setup-terraform@v3
-        if: steps.bindings.outputs.ready == 'true'
+        if: steps.ready.outputs.ready == 'true'
+      - uses: hashicorp/setup-terraform@v4
+        if: steps.ready.outputs.ready == 'true'
         with:
           terraform_wrapper: false
-      - uses: aws-actions/configure-aws-credentials@v4
-        if: steps.bindings.outputs.ready == 'true'
+      - uses: aws-actions/configure-aws-credentials@v6
+        if: steps.ready.outputs.ready == 'true'
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
-          role-to-assume: ${{ vars.DA_INFRA_PLAN_ROLE_ARN }}
-          audience: sts.amazonaws.com
+          role-to-assume: ${{ env.PLAN_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
-      - name: Plan dev
-        id: plan_dev
-        if: steps.bindings.outputs.ready == 'true'
-        env:
-          TF_VAR_aws_region: ${{ vars.DA_AWS_REGION }}
-          TF_VAR_state_bucket: ${{ vars.DA_STATE_BUCKET }}
+      - name: Plan (read-only, checked against the platform policy)
+        id: plan
+        if: steps.ready.outputs.ready == 'true'
         run: |
-          set -euo pipefail
-          terraform -chdir=infra/dev fmt -check
-          terraform -chdir=infra/dev init -input=false
-          terraform -chdir=infra/dev validate
-          set +e
-          terraform -chdir=infra/dev plan -input=false -lock=false -detailed-exitcode -out=plan.tfplan -no-color > /tmp/terraform-plan.log 2>&1
-          result=$?
-          set -e
-          if (( result != 0 && result != 2 )); then echo 'Terraform plan failed (output suppressed to protect values)' >&2; exit "$result"; fi
-          terraform -chdir=infra/dev show -json plan.tfplan > infra/dev/plan.json
-          python3 infra/policy_check.py infra/dev infra/dev/plan.json
-          python3 - <<'PY'
-          import json, os
-          data = json.load(open('infra/dev/plan.json'))
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
-              out.write('### infra/dev\n\n| Address | Actions |\n| --- | --- |\n')
-              for item in data.get('resource_changes', []):
-                  actions = item['change']['actions']
-                  if actions != ['no-op']:
-                      address = item['address'].replace('|', '\\|').replace('`', '')
-                      out.write(f'| `{address}` | {", ".join(actions)} |\n')
-          PY
-          if (( result == 2 )); then echo 'changed=true' >> "$GITHUB_OUTPUT"; else echo 'changed=false' >> "$GITHUB_OUTPUT"; fi
-  apply_dev:
-    if: github.event_name == 'push' && needs.plan.outputs.ready == 'true' && needs.plan.outputs.dev_changed == 'true'
-    needs: plan
-    runs-on: ubuntu-latest
-    environment: dev-infra
-    steps:
-      - name: Mask bindings and check infrastructure
-        env:
-          DA_AWS_REGION: ${{ vars.DA_AWS_REGION }}
-          DA_INFRA_APPLY_ROLE_ARN_DEV: ${{ vars.DA_INFRA_APPLY_ROLE_ARN_DEV }}
-          DA_STATE_BUCKET: ${{ vars.DA_STATE_BUCKET }}
-        run: |
-          for value in "$DA_AWS_REGION" "$DA_INFRA_APPLY_ROLE_ARN_DEV" "$DA_STATE_BUCKET"; do
-            if [[ -n "$value" ]]; then echo "::add-mask::$value"; fi
+          for pair in infra/dev=dev; do
+            root="${pair%%=*}"; key="${pair#*=}"
+            terraform -chdir="$root" fmt -check -recursive
+            terraform -chdir="$root" init -input=false -lock=false
+            terraform -chdir="$root" validate -no-color
+            set +e
+            terraform -chdir="$root" plan -input=false -lock=false -no-color -detailed-exitcode -out=tfplan > /dev/null
+            code=$?
+            set -e
+            [ "$code" -ne 1 ] || { echo "::error::plan failed for $root"; exit 1; }
+            terraform -chdir="$root" show -json tfplan > "$root/plan.json"
+            python3 infra/policy_check.py "$root" "$root/plan.json"
+            echo "## $root" >> "$GITHUB_STEP_SUMMARY"
+            terraform -chdir="$root" show -no-color tfplan | grep -E '^\s+# ' | sed 's/^ *//' >> "$GITHUB_STEP_SUMMARY" || true
+            if [ "$code" -eq 2 ]; then echo "$key=true" >> "$GITHUB_OUTPUT"; else echo "$key=false" >> "$GITHUB_OUTPUT"; fi
           done
-          if [[ -z "$DA_AWS_REGION" || -z "$DA_INFRA_APPLY_ROLE_ARN_DEV" ]]; then echo 'infrastructure not applied yet' >&2; exit 1; fi
+  apply-dev:
+    needs: ["plan"]
+    if: >-
+      always() && github.event_name == 'push' && needs.plan.result == 'success' &&
+      needs.plan.outputs.dev == 'true'
+    runs-on: ubuntu-24.04
+    environment: "dev-infra"
+    env:
+      APPLY_ROLE: ${{ secrets.DA_INFRA_APPLY_ROLE_ARN_DEV }}
+    steps:
       - uses: actions/checkout@v7
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-region: ${{ vars.DA_AWS_REGION }}
-          role-to-assume: ${{ vars.DA_INFRA_APPLY_ROLE_ARN_DEV }}
-          audience: sts.amazonaws.com
+          role-to-assume: ${{ env.APPLY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
-      - name: Re-plan, check policy, and apply the exact checked plan
-        env:
-          TF_VAR_aws_region: ${{ vars.DA_AWS_REGION }}
-          TF_VAR_state_bucket: ${{ vars.DA_STATE_BUCKET }}
+      - name: Apply infra/dev (exactly the plan that passed the policy check)
         run: |
-          set -euo pipefail
-          terraform -chdir=infra/dev fmt -check
           terraform -chdir=infra/dev init -input=false
-          terraform -chdir=infra/dev validate
-          if ! terraform -chdir=infra/dev plan -input=false -out=plan.tfplan -no-color > /tmp/terraform-plan.log 2>&1; then
-            echo 'Terraform plan failed (output suppressed to protect values)' >&2; exit 1
-          fi
-          terraform -chdir=infra/dev show -json plan.tfplan > infra/dev/plan.json
+          terraform -chdir=infra/dev plan -input=false -no-color -out=tfplan > /dev/null
+          terraform -chdir=infra/dev show -json tfplan > infra/dev/plan.json
           python3 infra/policy_check.py infra/dev infra/dev/plan.json
-          terraform -chdir=infra/dev apply -input=false -auto-approve plan.tfplan > /tmp/terraform-apply.log 2>&1 || { echo 'Terraform apply failed (output suppressed to protect values)' >&2; exit 1; }
+          terraform -chdir=infra/dev apply -input=false -no-color tfplan

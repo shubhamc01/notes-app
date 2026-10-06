@@ -1,2 +1,4 @@
+# ENGINE-RENDERED by devops-agent — do not edit. The release bundle: compose file + deploy/ for the host.
 FROM scratch
-COPY docker-compose.prod.yml deploy/ /app/
+COPY docker-compose.prod.yml /app/docker-compose.prod.yml
+COPY deploy/ /app/deploy/
