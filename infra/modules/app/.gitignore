@@ -1,7 +1,0 @@
-# added by devops-agent — terraform state/plans hold secret values; never commit them
-.terraform/
-*.tfstate
-*.tfstate.*
-*.tfplan
-tfplan
-crash.log
